@@ -2,26 +2,36 @@ function Start-AuditLogOrchestrator {
     <#
     .SYNOPSIS
     Start the Audit Log Polling Orchestrator
+
+    .FUNCTIONALITY
+    Entrypoint
     #>
     [CmdletBinding(SupportsShouldProcess = $true)]
     param()
     try {
         $AuditLogSearchesTable = Get-CIPPTable -TableName 'AuditLogSearches'
-        $AuditLogSearches = Get-CIPPAzDataTableEntity @AuditLogSearchesTable -Filter "CippStatus eq 'Pending'"
+        $15MinutesAgo = (Get-Date).AddMinutes(-15).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+        $1DayAgo = (Get-Date).AddDays(-1).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+        $AuditLogSearches = Get-CIPPAzDataTableEntity @AuditLogSearchesTable -Filter "(CippStatus eq 'Pending' or (CippStatus eq 'Processing' and Timestamp le datetime'$15MinutesAgo')) and Timestamp ge datetime'$1DayAgo'" -Property PartitionKey, RowKey, Tenant, CippStatus, Timestamp
+
+        $WebhookRulesTable = Get-CIPPTable -TableName 'WebhookRules'
+        $WebhookRules = Get-CIPPAzDataTableEntity @WebhookRulesTable
 
         if (($AuditLogSearches | Measure-Object).Count -eq 0) {
             Write-Information 'No audit log searches available'
+        } elseif (($AuditLogSearches | Measure-Object).Count -eq 0 -and ($WebhookRules | Measure-Object).Count -eq 0) {
+            Write-Information 'No webhook rules defined'
         } else {
-            $Queue = New-CippQueueEntry -Name 'Audit Log Collection' -Reference 'AuditLogCollection' -TotalTasks ($AuditLogSearches).Count
-            $Batch = $AuditLogSearches | Sort-Object -Property Tenant -Unique | Select-Object @{Name = 'TenantFilter'; Expression = { $_.Tenant } }, @{Name = 'QueueId'; Expression = { $Queue.RowKey } }, @{Name = 'FunctionName'; Expression = { 'AuditLogTenant' } }
-
-            $InputObject = [PSCustomObject]@{
-                OrchestratorName = 'AuditLogs'
-                Batch            = @($Batch)
-                SkipLog          = $true
-            }
+            Write-Information "Audit Logs: Downloading $($AuditLogSearches.Count) searches"
             if ($PSCmdlet.ShouldProcess('Start-AuditLogOrchestrator', 'Starting Audit Log Polling')) {
-                Start-NewOrchestration -FunctionName 'CIPPOrchestrator' -InputObject ($InputObject | ConvertTo-Json -Depth 5 -Compress)
+                $Queue = New-CippQueueEntry -Name 'Audit Logs Download' -Reference 'AuditLogsDownload' -TotalTasks ($AuditLogSearches).Count
+                $Batch = $AuditLogSearches | Sort-Object -Property Tenant -Unique | Select-Object @{Name = 'TenantFilter'; Expression = { $_.Tenant } }, @{Name = 'QueueId'; Expression = { $Queue.RowKey } }, @{Name = 'FunctionName'; Expression = { 'AuditLogTenantDownload' } }
+                $InputObject = [PSCustomObject]@{
+                    OrchestratorName = 'AuditLogsDownload'
+                    Batch            = @($Batch)
+                    SkipLog          = $true
+                }
+                Start-CIPPOrchestrator -InputObject $InputObject
             }
         }
     } catch {
